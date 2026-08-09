@@ -8,6 +8,7 @@ training rank and the rendezvous host. See [../README.md](../README.md) for why.
 nvrx_singleton_array.sbatch   one generation: rendezvous, gate, ft_launcher, teardown
 submit_chain.sh               computes the array shape and enqueues K generations
 drain_poller.sh               optional: bridges Slurm drain state into an in-job restart
+scheduler_exclusion_poller.sh optional: publishes scheduler-unavailable array tasks
 ```
 
 ## Requirements
@@ -265,3 +266,49 @@ single-read contract.
 
 An out-of-container consumer was deliberately avoided: it can't set a controlled exit code and
 would fight ft_launcher's restart logic — the decision belongs where the restart is made.
+
+## `scheduler_exclusion_poller.sh` — publish a job-scoped exclusion decision
+
+This producer serves consumers that expect one compact Scheduler Exclusion
+artifact rather than the per-task markers above. Run one copy on **array task
+0's Node0**, outside the workload container:
+
+```bash
+SCHEDULER_EXCLUSION_DIR="<shared-dir>/${SLURM_ARRAY_JOB_ID}/scheduler-exclusions"
+OUTPUT_DIR="${SCHEDULER_EXCLUSION_DIR}" \
+ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID}" \
+  bash scheduler_exclusion_poller.sh &
+SCHEDULER_EXCLUSION_POLLER_PID=$!
+trap 'kill "${SCHEDULER_EXCLUSION_POLLER_PID}" 2>/dev/null || true' EXIT
+```
+
+Every successful pass performs one filtered `sinfo` query. When unavailable
+nodes exist, one node-filtered `squeue` query returns only affected running
+array tasks; good-only task node lists are not processed. The producer maps
+nodes in `DRAIN`, `DOWN`, `FAIL`, or `NO_RESPOND` state and atomically replaces:
+
+```text
+${SCHEDULER_EXCLUSION_DIR}/segment_health_check.${SLURM_ARRAY_JOB_ID}.state
+```
+
+The first record is the complete compact task decision:
+
+```json
+["7","12"]
+```
+
+It is followed by the same decision schema used by the Scheduler Exclusion
+service: an array-task decision and an empty node decision. Per-node
+observations are intentionally omitted because they are not needed by the FT
+consumer and would require expanding affected task node lists. `restart_count`
+is `0` under the required `--no-requeue` deployment.
+
+The producer publishes only after a complete pass. Slurm errors and malformed
+rows preserve the previous artifact. A
+successful pass always replaces the file, even if the compact decision is
+unchanged, so its modification time remains a consumer freshness lease. The
+default cadence is 10 minutes and each Slurm query has a 30-second timeout.
+
+Like the per-task producer, this task-ID-only contract requires an explicitly
+non-requeued array and an output directory scoped to `SLURM_ARRAY_JOB_ID`.
+Producer logs remain in batch stdout/stderr.
