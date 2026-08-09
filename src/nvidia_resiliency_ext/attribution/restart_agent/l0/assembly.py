@@ -16,7 +16,6 @@ from typing import Iterable, Iterator, Mapping, Sequence, overload
 from ..identity import (
     build_affected_entity,
     canonical_observed_fingerprint,
-    extract_data_position_fingerprint,
     extract_failure_iteration,
     extract_gpu,
     extract_node,
@@ -55,8 +54,9 @@ from ..models import (
     PostFaultSummary,
     ProgressFacts,
     ProgressMarker,
-    RecoveryBehavior,
     RegistryRole,
+    RetryLifecycle,
+    RetryLifecycleState,
     RunProgressSummary,
 )
 from .registry import (
@@ -67,6 +67,7 @@ from .registry import (
     root_fingerprint,
     signature_for,
 )
+from .retry_lifecycle import classify_retry_lifecycle, retry_lifecycle_blocks_primary
 
 _MEGATRON_ITERATION_RE = re.compile(
     r"^\s*(?:(?P<rank_prefix>\d+):\s*)?"
@@ -208,6 +209,10 @@ _PROCESS_TERMINATION_RE = re.compile(
     r"|Fatal Python error:\s*(?:Aborted|Segmentation fault)\b",
     re.I,
 )
+_CONCRETE_TERMINATION_RE = re.compile(
+    r"\b(?:segmentation fault|segfault|illegal instruction|core dumped)\b",
+    re.I,
+)
 _SCHEDULER_CANCEL_RE = re.compile(
     r"\b(?:CANCELLED AT|STEP\b.*\bCANCELLED|slurmstepd\b.*\bCANCELLED)\b",
     re.I,
@@ -217,6 +222,12 @@ _CLEANUP_FRAME_RE = re.compile(
     r"destroy_process_group|sem_unlink)\b",
     re.I,
 )
+_IDENTITY_REASON_TERMINAL = "terminal_exception"
+_IDENTITY_REASON_TIMEOUT_PRECURSOR = "observed_precursor_aligned_with_terminal_timeout"
+_IDENTITY_REASON_NEARBY_PRECURSOR = "nearby_high_signal_error_precedes_failure_episode"
+_IDENTITY_REASON_CAUSE_CONFIRMATION = "explicit_cause_confirmation"
+_GENERIC_OBSERVED_REGISTRY_ID = "observed_exception"
+_PRIMARY_ELIGIBLE_OUTCOMES = frozenset({FaultOutcome.TERMINAL.value, FaultOutcome.UNRESOLVED.value})
 _ITERATION_VALUE_RE = re.compile(r"\biteration\s+(?P<iteration>\d+)\b", re.I)
 _CONFIG_PATH_RE = re.compile(
     r"^\s*(?:\d+:\s*)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s+\.{2,}\s+" r"(?P<path>/\S+)"
@@ -229,6 +240,8 @@ _PERMISSION_DENIED_PATH_RE = re.compile(
     r"(?P<quote>['\"])(?P<path>/[^'\"]+)(?P=quote)",
     re.I,
 )
+_MISSING_PATH_SIGNAL_RE = re.compile(r"\b(?:FileNotFoundError|No such file or directory)\b", re.I)
+_QUOTED_ABSOLUTE_PATH_RE = re.compile(r"(?P<quote>['\"])(?P<path>/[^'\"]+)(?P=quote)")
 _USER_NAMESPACE_RE = re.compile(r"/users/(?P<namespace>[^/]+)/", re.I)
 _READ_PATH_KEYS = {
     "data_path",
@@ -249,6 +262,7 @@ CONTEXT_WINDOW_BEFORE_LINES = 40
 CONTEXT_WINDOW_AFTER_LINES = 140
 MAX_CONTEXT_WINDOW_SEEDS = 8
 MAX_CONTEXT_HIGH_SIGNAL_SEEDS = 3
+CONTEXT_WINDOW_SELECTION_RULE = "episode_cause_signal_registry"
 MAX_CANDIDATE_ANCHORS = 16
 MAX_HIGH_SIGNAL_ANCHORS = 8
 MAX_FAILURE_EPISODES = 3
@@ -396,6 +410,7 @@ class _RegistryObservation:
     node: str | None
     gpu: str | None
     teardown_exception: bool
+    retry_lifecycle: RetryLifecycle | None
 
     @property
     def registry_id(self) -> str:
@@ -445,7 +460,9 @@ class _DetectedEvidence:
 @dataclass(frozen=True)
 class _ContextualEvidence:
     primary: FailureEvidence | None
+    selected_observed_failure: FailureEvidence | None
     context_windows: tuple[ContextWindow, ...]
+    context_window_selection: Mapping[str, object]
     failure_episodes: tuple[FailureEpisode, ...]
     cascades: tuple[CascadeEvidence, ...]
     post_fault_summaries: tuple[PostFaultSummary, ...]
@@ -454,6 +471,30 @@ class _ContextualEvidence:
     job_metadata: JobMetadata
     run_progress_summary: RunProgressSummary
     operation_artifact_comparisons: tuple[OperationArtifactComparisonEvidence, ...]
+
+
+@dataclass(frozen=True)
+class _ContextWindowSelection:
+    windows: tuple[ContextWindow, ...]
+    eligible_seed_count: int
+    selected_seed_count: int
+    omitted_seed_count: int
+    limit: int
+    rule: str = CONTEXT_WINDOW_SELECTION_RULE
+
+    @property
+    def cap_hit(self) -> bool:
+        return self.omitted_seed_count > 0
+
+    def to_payload(self) -> dict[str, int | bool]:
+        return {
+            "rule": self.rule,
+            "eligible_seed_count": self.eligible_seed_count,
+            "selected_seed_count": self.selected_seed_count,
+            "omitted_seed_count": self.omitted_seed_count,
+            "limit": self.limit,
+            "cap_hit": self.cap_hit,
+        }
 
 
 class L0ObservationAccumulator(Sequence[LogLine]):
@@ -607,6 +648,7 @@ class L0ObservationAccumulator(Sequence[LogLine]):
         rank_text = str(rank) if rank is not None else None
         if "/" in text and (
             _PERMISSION_DENIED_PATH_RE.search(text)
+            or (_MISSING_PATH_SIGNAL_RE.search(text) and _QUOTED_ABSOLUTE_PATH_RE.search(text))
             or _CONFIG_PATH_RE.search(text)
             or _INLINE_PATH_RE.search(text)
         ):
@@ -616,7 +658,9 @@ class L0ObservationAccumulator(Sequence[LogLine]):
             self.progress_candidate_lines.append(item)
 
         if _contains_any(lowered, _TERMINAL_TRIGGER_TERMS) and _TERMINAL_RE.search(text):
-            self.terminal_lines.append(item.line)
+            retry_lifecycle = classify_retry_lifecycle(text)
+            if not retry_lifecycle_blocks_primary(retry_lifecycle):
+                self.terminal_lines.append(item.line)
 
         diagnostic_kind = (
             diagnostic_context_kind(text) if "cuda" in lowered or "stacktrace" in lowered else None
@@ -781,7 +825,12 @@ def _detect_evidence(lines: Sequence[LogLine]) -> _DetectedEvidence:
     terminal_lines = (
         tuple(lines.terminal_lines)
         if isinstance(lines, L0ObservationAccumulator)
-        else tuple(item.line for item in lines if _TERMINAL_RE.search(item.text))
+        else tuple(
+            item.line
+            for item in lines
+            if _TERMINAL_RE.search(item.text)
+            and not retry_lifecycle_blocks_primary(classify_retry_lifecycle(item.text))
+        )
     )
     episode_event_lines = _episode_event_lines(lines)
     registry_observations = tuple(_collect_registry_observations(lines, progress, terminal_lines))
@@ -854,20 +903,17 @@ def _contextualize_evidence(
     detected: _DetectedEvidence,
 ) -> _ContextualEvidence:
     episode_event_lines = _episode_event_lines(lines)
-    context_windows = tuple(
-        _build_context_windows(
-            lines,
-            detected.occurrence_groups,
-            detected.registry_matches,
-            detected.prompt_high_signal_lines,
-            failure_episode_lines=_failure_episode_seed_lines(
-                detected.preliminary_failure_episodes
-            ),
-            cause_confirmation_lines=tuple(
-                match.line for match in detected.cause_confirmations if match.line is not None
-            ),
-        )
+    context_window_selection = _build_context_windows(
+        lines,
+        detected.occurrence_groups,
+        detected.registry_matches,
+        detected.prompt_high_signal_lines,
+        failure_episode_lines=_failure_episode_seed_lines(detected.preliminary_failure_episodes),
+        cause_confirmation_lines=tuple(
+            match.line for match in detected.cause_confirmations if match.line is not None
+        ),
     )
+    context_windows = context_window_selection.windows
     failure_episodes = tuple(
         _build_failure_episodes(
             lines,
@@ -945,9 +991,17 @@ def _contextualize_evidence(
         )
     )
     primary = _attach_operation_artifact_entity(primary, operation_artifact_comparisons)
+    primary = _attach_failed_path_entity(primary, detected.path_access_facts)
+    selected_observed_failure = _select_observed_failure(
+        detected.registry_matches,
+        primary=primary,
+        last_progress_line=detected.progress.last_progress_line,
+    )
     return _ContextualEvidence(
         primary=primary,
+        selected_observed_failure=selected_observed_failure,
         context_windows=context_windows,
+        context_window_selection=context_window_selection.to_payload(),
         failure_episodes=failure_episodes,
         cascades=cascades,
         post_fault_summaries=post_fault_summaries,
@@ -1012,6 +1066,42 @@ def _operation_artifact_identity(
     return identity
 
 
+def _attach_failed_path_entity(
+    primary: FailureEvidence | None,
+    path_access_facts: Sequence[Mapping[str, object]],
+) -> FailureEvidence | None:
+    """Attach one explicit path failed by the already-selected primary."""
+
+    if primary is None or primary.affected_entity is not None or primary.line is None:
+        return primary
+    identities = set(_explicit_failed_paths(primary.quote or primary.signature))
+    identities.update(
+        {
+            str(item["path"])
+            for item in path_access_facts
+            if item.get("line") == primary.line
+            and item.get("role") == "failed_access"
+            and item.get("path")
+        }
+    )
+    if len(identities) != 1:
+        return primary
+    return replace(
+        primary,
+        affected_entity=build_affected_entity(
+            AffectedEntityKind.ARTIFACT,
+            identities.pop(),
+            evidence_line=primary.line,
+        ),
+    )
+
+
+def _explicit_failed_paths(text: str) -> tuple[str, ...]:
+    if not (_MISSING_PATH_SIGNAL_RE.search(text) or _PERMISSION_DENIED_PATH_RE.search(text)):
+        return ()
+    return tuple(match.group("path") for match in _QUOTED_ABSOLUTE_PATH_RE.finditer(text))
+
+
 def _assemble_bundle(
     log_path: str,
     byte_size: int,
@@ -1019,6 +1109,7 @@ def _assemble_bundle(
     detected: _DetectedEvidence,
     contextual: _ContextualEvidence,
 ) -> L0Bundle:
+    _validate_l0a_selection_accounting(contextual)
     coverage = dict(
         _coverage(
             path_hint_count=len(path_hints(log_path)),
@@ -1049,6 +1140,7 @@ def _assemble_bundle(
         candidate_anchors=contextual.candidate_anchors,
         registry_matches=detected.registry_matches,
         deterministic_primary_candidate=contextual.primary,
+        selected_observed_failure=contextual.selected_observed_failure,
         cascades=contextual.cascades,
         cause_confirmations=detected.cause_confirmations,
         failure_episodes=contextual.failure_episodes,
@@ -1075,6 +1167,11 @@ def _selection_summary(
     run = contextual.run_progress_summary
     operations = contextual.operation_artifact_comparisons
     later_progress = contextual.later_progress_after_fault_observations
+    caps_hit: list[str] = []
+    if detected.dropped_registry_matches:
+        caps_hit.append("registry_matches_per_pattern")
+    if contextual.context_window_selection["cap_hit"]:
+        caps_hit.append("context_window_seeds")
     return {
         "raw_lines": len(lines),
         "candidate_lines_after_filters": len(detected.registry_observations),
@@ -1101,9 +1198,21 @@ def _selection_summary(
         "later_progress_after_fault_observation_count": len(later_progress),
         "later_progress_after_fault_event_count": sum(item.event_count for item in later_progress),
         "cause_confirmation_count": detected.cause_confirmation_count,
+        "primary_episode_id": _primary_episode_id(contextual),
+        "primary_episode_selection_basis": _primary_episode_selection_basis(contextual),
         "primary_selection_basis": _primary_selection_basis(detected, contextual),
         "primary_selection_line": (
             contextual.primary.line if contextual.primary is not None else None
+        ),
+        "selected_observation_line": (
+            contextual.selected_observed_failure.line
+            if contextual.selected_observed_failure is not None
+            else None
+        ),
+        "selected_observation_basis": (
+            "unique_terminal_observation_after_last_progress"
+            if contextual.selected_observed_failure is not None
+            else "not_available"
         ),
         "path_access_fact_count": len(detected.path_access_facts),
         "path_namespace_mismatch_observed": bool(
@@ -1113,10 +1222,29 @@ def _selection_summary(
         "sampled_candidate_lines": sum(
             max(0, group.count - len(group.sample_lines)) for group in detected.occurrence_groups
         ),
-        "caps_hit": (["registry_matches_per_pattern"] if detected.dropped_registry_matches else []),
+        "context_window_selection": dict(contextual.context_window_selection),
+        "caps_hit": caps_hit,
         "primary_after_context_available": _has_after_context(contextual.primary, lines),
         "cited_error_only_evidence": False,
     }
+
+
+def _validate_l0a_selection_accounting(contextual: _ContextualEvidence) -> None:
+    accounting = contextual.context_window_selection
+    if accounting.get("rule") != CONTEXT_WINDOW_SELECTION_RULE:
+        raise ValueError("L0A context-window selection rule is missing or unsupported")
+    eligible = int(accounting["eligible_seed_count"])
+    selected = int(accounting["selected_seed_count"])
+    omitted = int(accounting["omitted_seed_count"])
+    limit = int(accounting["limit"])
+    if eligible != selected + omitted:
+        raise ValueError("L0A context-window selection accounting does not reconcile")
+    if selected != len(contextual.context_windows):
+        raise ValueError("L0A context-window selected count does not match emitted windows")
+    if selected > limit:
+        raise ValueError("L0A context-window selection exceeds its declared limit")
+    if bool(accounting["cap_hit"]) != (omitted > 0):
+        raise ValueError("L0A context-window cap status does not match omitted count")
 
 
 def _line_numbering_anomaly() -> Mapping[str, str]:
@@ -1157,6 +1285,24 @@ def _primary_selection_basis(
     ):
         return "failure_episode_identity"
     return "contextual_observed_failure"
+
+
+def _primary_episode_id(contextual: _ContextualEvidence) -> str | None:
+    primary = contextual.primary
+    if primary is None or primary.line is None:
+        return None
+    for episode in _ordered_primary_episodes(contextual.failure_episodes):
+        if primary.line in _episode_evidence_lines(episode):
+            return episode.episode_id
+    return None
+
+
+def _primary_episode_selection_basis(contextual: _ContextualEvidence) -> str:
+    if _primary_episode_id(contextual) is not None:
+        return "earliest_eligible_initiating_episode"
+    if contextual.primary is not None:
+        return "eligible_registry_root_without_episode"
+    return "not_available"
 
 
 def _collect_path_access_facts(
@@ -1206,6 +1352,16 @@ def _collect_path_access_facts(
                 ),
                 source="permission_denied_exception",
             )
+
+        if _MISSING_PATH_SIGNAL_RE.search(item.text):
+            for path_match in _QUOTED_ABSOLUTE_PATH_RE.finditer(item.text):
+                add_fact(
+                    item,
+                    path=path_match.group("path"),
+                    role="failed_access",
+                    access_intent="unknown",
+                    source="missing_path_exception",
+                )
 
         config_match = _CONFIG_PATH_RE.search(item.text)
         if config_match is not None:
@@ -1624,7 +1780,14 @@ def _collect_registry_observations(
         rank = extract_rank(item.text)
         node = extract_node(item.text)
         gpu = extract_gpu(item.text)
-        outcome = _candidate_outcome(item.line, item.text, progress, terminal_lines)
+        retry_lifecycle = classify_retry_lifecycle(item.text)
+        outcome = _candidate_outcome(
+            item.line,
+            item.text,
+            progress,
+            terminal_lines,
+            retry_lifecycle=retry_lifecycle,
+        )
         phase = (
             "teardown" if teardown_exception else _phase_for_line(item.line, item.text, progress)
         )
@@ -1653,6 +1816,7 @@ def _collect_registry_observations(
                     node=node,
                     gpu=gpu,
                     teardown_exception=teardown_exception,
+                    retry_lifecycle=retry_lifecycle,
                 )
             )
     return result
@@ -1679,11 +1843,10 @@ def _enrich_registry_observation(
         node=observation.node,
         gpu=observation.gpu,
         failure_iteration=extract_failure_iteration(observation.quote),
-        data_position_fingerprint=extract_data_position_fingerprint(observation.quote),
         registry_id=observation.registry_id,
         role=observation.role,
-        recovery_behavior=observation.row.recovery_behavior,
         root_fingerprint_source=fingerprint_source,
+        retry_lifecycle=observation.retry_lifecycle,
     )
 
 
@@ -1958,6 +2121,8 @@ def _candidate_outcome(
     text: str,
     progress: ProgressFacts,
     terminal_lines: Sequence[int],
+    *,
+    retry_lifecycle: RetryLifecycle | None = None,
 ) -> str:
     if _has_later(progress.progress_lines, line_no) or _has_later(
         progress.checkpoint_lines, line_no
@@ -1965,6 +2130,11 @@ def _candidate_outcome(
         return FaultOutcome.PROGRESSED_AFTER.value
     if _has_later(progress.recovery_lines, line_no):
         return FaultOutcome.RECOVERED.value
+    if retry_lifecycle is not None:
+        if retry_lifecycle.state == RetryLifecycleState.SUCCEEDED:
+            return FaultOutcome.RECOVERED.value
+        if retry_lifecycle.state == RetryLifecycleState.PENDING:
+            return FaultOutcome.RETRY_PENDING.value
     if _TERMINAL_RE.search(text) or _has_later(terminal_lines, line_no):
         return FaultOutcome.TERMINAL.value
     if terminal_lines and line_no >= max(1, terminal_lines[-1] - 80):
@@ -2098,6 +2268,7 @@ def _build_occurrence_groups(
                     match.line for match in group_matches[:5] if match.line is not None
                 ),
                 rank_spread=tuple(sorted({match.rank for match in group_matches if match.rank})),
+                unattributed_occurrence_count=sum(1 for match in group_matches if not match.rank),
                 node_spread=tuple(sorted({match.node for match in group_matches if match.node})),
                 gpu_spread=tuple(sorted({match.gpu for match in group_matches if match.gpu})),
                 registry_id=registry_id,
@@ -2121,24 +2292,156 @@ def _classification_for(match: _RegistryObservation | _OccurrenceSeed) -> str:
 def _select_primary_candidate(
     matches: Sequence[FailureEvidence],
 ) -> FailureEvidence | None:
-    root_matches = [
+    eligible_roots = [
         match
         for match in matches
         if match.role in {RegistryRole.ROOT_CANDIDATE.value, RegistryRole.EITHER.value}
-        and match.fault_outcome
-        not in {FaultOutcome.RECOVERED.value, FaultOutcome.PROGRESSED_AFTER.value}
+        and match.causal_role not in {CausalRole.CASCADE.value, CausalRole.TEARDOWN.value}
+        and match.fault_outcome in _PRIMARY_ELIGIBLE_OUTCOMES
+        and not retry_lifecycle_blocks_primary(match.retry_lifecycle)
     ]
-    if root_matches:
-        return sorted(root_matches, key=lambda match: match.line or 0)[0]
+    return min(eligible_roots, key=_failure_evidence_order_key, default=None)
 
-    progressed_roots = [
+
+def _select_observed_failure(
+    matches: Sequence[FailureEvidence],
+    *,
+    primary: FailureEvidence | None,
+    last_progress_line: int | None,
+) -> FailureEvidence | None:
+    """Select one visible terminal surface without promoting it to a root."""
+
+    if primary is not None:
+        return None
+    eligible = tuple(
         match
         for match in matches
-        if match.role in {RegistryRole.ROOT_CANDIDATE.value, RegistryRole.EITHER.value}
+        if match.registry_id == "terminal_transport_failure_surface"
+        and match.fault_outcome in _PRIMARY_ELIGIBLE_OUTCOMES
+        and match.line is not None
+        and (last_progress_line is None or match.line > last_progress_line)
+        and not retry_lifecycle_blocks_primary(match.retry_lifecycle)
+    )
+    identities = {
+        match.root_fingerprint or f"{match.failure_class}:{normalized_pattern(match.signature)}"
+        for match in eligible
+    }
+    if len(identities) != 1:
+        return None
+    selected = min(eligible, key=_failure_evidence_order_key)
+    return replace(
+        selected,
+        root_fingerprint=None,
+        root_fingerprint_source=None,
+        affected_entity=None,
+        observation_fingerprint=identities.pop(),
+        observation_fingerprint_source="l0_registry_observation",
+    )
+
+
+def _failure_evidence_order_key(
+    match: FailureEvidence,
+) -> tuple[bool, int, bool, str, str, str, str]:
+    """Return a stable source-order key for otherwise equivalent evidence."""
+
+    return (
+        match.line is None,
+        match.line if match.line is not None else 0,
+        match.registry_id == _GENERIC_OBSERVED_REGISTRY_ID,
+        match.registry_id or "",
+        match.failure_class,
+        match.signature,
+        match.root_fingerprint or "",
+    )
+
+
+def _episode_is_primary_eligible(episode: FailureEpisode) -> bool:
+    if episode.status not in _PRIMARY_ELIGIBLE_OUTCOMES:
+        return False
+    if episode.terminal_exception_causal_role_hint not in {
+        CausalRole.CASCADE.value,
+        CausalRole.TEARDOWN.value,
+    }:
+        return True
+    return bool(
+        episode.identity_anchor_line is not None
+        and episode.identity_anchor_line != episode.terminal_exception_line
+    )
+
+
+def _episode_evidence_lines(episode: FailureEpisode) -> frozenset[int]:
+    return frozenset(
+        line_no
+        for line_no in (
+            *episode.precursor_lines,
+            *episode.exception_chain_lines,
+            episode.terminal_exception_line,
+            episode.identity_anchor_line,
+            *(item.line for item in episode.cause_confirmations),
+        )
+        if line_no is not None
+    )
+
+
+def _primary_episode_order_key(episode: FailureEpisode) -> tuple[int, int, int, str]:
+    """Order eligible episodes by their initiating identity in source order."""
+
+    identity_line = (
+        episode.identity_anchor_line
+        or episode.terminal_exception_line
+        or episode.first_exception_line
+    )
+    terminal_line = episode.terminal_exception_line or episode.end_line
+    return (identity_line, episode.start_line, terminal_line, episode.episode_id)
+
+
+def _ordered_primary_episodes(
+    episodes: Sequence[FailureEpisode],
+) -> tuple[FailureEpisode, ...]:
+    return tuple(
+        sorted(
+            (episode for episode in episodes if _episode_is_primary_eligible(episode)),
+            key=_primary_episode_order_key,
+        )
+    )
+
+
+def _identity_match_for_episode(
+    matches: Sequence[FailureEvidence],
+    episode: FailureEpisode,
+    identity_line: int,
+) -> FailureEvidence | None:
+    candidates = [
+        match
+        for match in matches
+        if match.line == identity_line
+        and not retry_lifecycle_blocks_primary(match.retry_lifecycle)
+        and match.role
+        in {
+            RegistryRole.ROOT_CANDIDATE.value,
+            RegistryRole.EITHER.value,
+            RegistryRole.CAUSE_CONFIRMATION.value,
+        }
     ]
-    if progressed_roots:
-        return sorted(progressed_roots, key=lambda match: match.line or 0)[0]
-    return None
+    if not candidates:
+        return None
+
+    preferred_role = (
+        RegistryRole.CAUSE_CONFIRMATION.value
+        if episode.identity_anchor_reason == _IDENTITY_REASON_CAUSE_CONFIRMATION
+        else RegistryRole.ROOT_CANDIDATE.value
+    )
+    return min(
+        candidates,
+        key=lambda match: (
+            (
+                0
+                if match.role == preferred_role
+                else 1 if match.role == RegistryRole.EITHER.value else 2
+            ),
+            *_failure_evidence_order_key(match),
+        ),
+    )
 
 
 def _canonicalize_episode_primary(
@@ -2148,40 +2451,21 @@ def _canonicalize_episode_primary(
     lines: Sequence[LogLine],
     progress: ProgressFacts,
 ) -> FailureEvidence | None:
-    for episode in episodes:
+    for episode in _ordered_primary_episodes(episodes):
         terminal_line = episode.terminal_exception_line
         identity_line = episode.identity_anchor_line or terminal_line
-        observed_lines = {
-            *episode.precursor_lines,
-            *episode.exception_chain_lines,
-            terminal_line,
-            identity_line,
-        }
         if terminal_line is None:
             continue
-        if primary is not None and primary.line not in observed_lines:
-            continue
         if (
-            primary is None
-            and _BARE_PROCESS_KILLED_RE.search(episode.terminal_exception_quote or "")
+            _BARE_PROCESS_KILLED_RE.search(episode.terminal_exception_quote or "")
             and not episode.cause_confirmations
         ):
             continue
         assert identity_line is not None
-        identity_match = next(
-            (
-                match
-                for match in matches
-                if match.line == identity_line
-                and match.role
-                in {
-                    RegistryRole.ROOT_CANDIDATE.value,
-                    RegistryRole.EITHER.value,
-                    RegistryRole.CAUSE_CONFIRMATION.value,
-                }
-            ),
-            None,
-        )
+        identity_text = lines[identity_line - 1].text if 1 <= identity_line <= len(lines) else ""
+        if retry_lifecycle_blocks_primary(classify_retry_lifecycle(identity_text)):
+            continue
+        identity_match = _identity_match_for_episode(matches, episode, identity_line)
         if identity_match is not None:
             return replace(
                 identity_match,
@@ -2194,7 +2478,6 @@ def _canonicalize_episode_primary(
             )
         if not 1 <= identity_line <= len(lines):
             continue
-        identity_text = lines[identity_line - 1].text
         terminal_match = next(
             (match for match in matches if match.line == terminal_line),
             None,
@@ -2222,14 +2505,17 @@ def _canonicalize_episode_primary(
             failure_iteration=(
                 extract_failure_iteration(identity_text) or episode.terminal_exception_iteration
             ),
-            data_position_fingerprint=extract_data_position_fingerprint(identity_text),
             role=RegistryRole.ROOT_CANDIDATE.value,
-            recovery_behavior=(
-                primary.recovery_behavior if primary is not None else RecoveryBehavior.NONE.value
-            ),
             root_fingerprint_source="observed_exception",
+            retry_lifecycle=classify_retry_lifecycle(identity_text),
         )
-    return primary
+    if (
+        primary is not None
+        and primary.fault_outcome in _PRIMARY_ELIGIBLE_OUTCOMES
+        and not retry_lifecycle_blocks_primary(primary.retry_lifecycle)
+    ):
+        return primary
+    return None
 
 
 def _build_failure_episodes(
@@ -2367,6 +2653,7 @@ def _build_failure_episodes(
         progress,
     )
     return _attach_cause_confirmations(
+        lines,
         with_precursors,
         cause_confirmations,
         context_windows,
@@ -3065,7 +3352,9 @@ def _attach_timeout_aligned_precursors(
                 replace(
                     episode,
                     identity_anchor_line=episode.identity_anchor_line or terminal_line,
-                    identity_anchor_reason=(episode.identity_anchor_reason or "terminal_exception"),
+                    identity_anchor_reason=(
+                        episode.identity_anchor_reason or _IDENTITY_REASON_TERMINAL
+                    ),
                 )
             )
             continue
@@ -3082,6 +3371,7 @@ def _attach_timeout_aligned_precursors(
                 _TERMINAL_OPERATION_TIMEOUT_RE.search(candidate_text)
                 or _TRACEBACK_RE.search(candidate_text)
                 or _CLEANUP_FRAME_RE.search(candidate_text)
+                or retry_lifecycle_blocks_primary(classify_retry_lifecycle(candidate_text))
             ):
                 continue
             candidate_time = _time_of_day_seconds(candidate_text)
@@ -3096,10 +3386,10 @@ def _attach_timeout_aligned_precursors(
 
         if precursor_lines:
             identity_anchor_line = min(precursor_lines)
-            identity_anchor_reason = "observed_precursor_aligned_with_terminal_timeout"
+            identity_anchor_reason = _IDENTITY_REASON_TIMEOUT_PRECURSOR
         else:
             identity_anchor_line = episode.identity_anchor_line or terminal_line
-            identity_anchor_reason = episode.identity_anchor_reason or "terminal_exception"
+            identity_anchor_reason = episode.identity_anchor_reason or _IDENTITY_REASON_TERMINAL
         result.append(
             replace(
                 episode,
@@ -3138,6 +3428,9 @@ def _attach_nearby_high_signal_precursors(
             and _SPECIFIC_FAILURE_CUE_RE.search(text_by_line.get(line_no, ""))
             and not _FAILURE_ANNOUNCEMENT_RE.search(text_by_line.get(line_no, ""))
             and not _CLEANUP_FRAME_RE.search(text_by_line.get(line_no, ""))
+            and not retry_lifecycle_blocks_primary(
+                classify_retry_lifecycle(text_by_line.get(line_no, ""))
+            )
             and not any(
                 line_no < progress_line < episode.start_line
                 for progress_line in (*progress.progress_lines, *progress.checkpoint_lines)
@@ -3152,13 +3445,14 @@ def _attach_nearby_high_signal_precursors(
                 episode,
                 precursor_lines=tuple(dict.fromkeys((*episode.precursor_lines, *candidates))),
                 identity_anchor_line=identity_anchor_line,
-                identity_anchor_reason="nearby_high_signal_error_precedes_failure_episode",
+                identity_anchor_reason=_IDENTITY_REASON_NEARBY_PRECURSOR,
             )
         )
     return result
 
 
 def _attach_cause_confirmations(
+    lines: Sequence[LogLine],
     episodes: Sequence[FailureEpisode],
     confirmations: Sequence[FailureEvidence],
     context_windows: Sequence[ContextWindow],
@@ -3167,7 +3461,7 @@ def _attach_cause_confirmations(
         return list(episodes)
 
     assigned: dict[int, list[FailureEvidence]] = defaultdict(list)
-    for confirmation in sorted(confirmations, key=lambda item: item.line or 0):
+    for confirmation in sorted(confirmations, key=_failure_evidence_order_key):
         if confirmation.line is None:
             continue
         eligible = [
@@ -3190,10 +3484,9 @@ def _attach_cause_confirmations(
                 and item[1].first_process_termination_line <= confirmation.line
             )
         ]
-        selected_index, _ = max(
-            termination_episodes or eligible,
-            key=lambda item: item[1].start_line,
-        )
+        if not termination_episodes:
+            continue
+        selected_index, _ = max(termination_episodes, key=lambda item: item[1].start_line)
         assigned[selected_index].append(confirmation)
 
     result: list[FailureEpisode] = []
@@ -3208,17 +3501,55 @@ def _attach_cause_confirmations(
             for window_id in _context_window_ids_for_line(context_windows, line_no):
                 if window_id not in context_ids:
                     context_ids.append(window_id)
+        promote_confirmation = _episode_identity_is_cause_unknown(lines, episode)
         result.append(
             replace(
                 episode,
                 end_line=max(episode.end_line, *confirmation_lines),
-                identity_anchor_line=confirmation_lines[0],
-                identity_anchor_reason="explicit_cause_confirmation",
+                identity_anchor_line=(
+                    confirmation_lines[0] if promote_confirmation else episode.identity_anchor_line
+                ),
+                identity_anchor_reason=(
+                    _IDENTITY_REASON_CAUSE_CONFIRMATION
+                    if promote_confirmation
+                    else episode.identity_anchor_reason
+                ),
                 cause_confirmations=sampled,
                 context_window_ids=tuple(context_ids),
             )
         )
     return result
+
+
+def _episode_identity_is_cause_unknown(
+    lines: Sequence[LogLine],
+    episode: FailureEpisode,
+) -> bool:
+    """Whether a linked cause confirmation may replace the current identity."""
+
+    if episode.identity_anchor_reason in {
+        _IDENTITY_REASON_TIMEOUT_PRECURSOR,
+        _IDENTITY_REASON_NEARBY_PRECURSOR,
+    }:
+        return False
+
+    identity_line = episode.identity_anchor_line or episode.terminal_exception_line
+    identity_text = _text_for_line(lines, identity_line) if identity_line is not None else ""
+    if _BARE_PROCESS_KILLED_RE.search(identity_text):
+        return True
+    if not _PROCESS_TERMINATION_RE.search(identity_text):
+        return False
+    return not any(
+        pattern.search(identity_text)
+        for pattern in (
+            _EXCEPTION_SUMMARY_RE,
+            _WATCHDOG_EXCEPTION_RE,
+            _CUDA_RUNTIME_STATUS_RE,
+            _TERMINAL_OPERATION_TIMEOUT_RE,
+            _SPECIFIC_FAILURE_CUE_RE,
+            _CONCRETE_TERMINATION_RE,
+        )
+    )
 
 
 def _sample_cause_confirmations(
@@ -3283,6 +3614,8 @@ def _nearest_prior_progress_marker(
 
 
 def _terminal_episode_priority(text: str) -> int:
+    if retry_lifecycle_blocks_primary(classify_retry_lifecycle(text)):
+        return 0
     if _TRACEBACK_RE.search(text):
         return 100
     if _EXCEPTION_SUMMARY_RE.search(text):
@@ -3317,7 +3650,11 @@ def _traceback_start_for_line(
 
 
 def _terminal_exception_line(lines: Sequence[LogLine], start_line: int) -> int | None:
+    pending_retry_observed = False
     for item in lines[start_line - 1 : min(len(lines), start_line + 120)]:
+        if retry_lifecycle_blocks_primary(classify_retry_lifecycle(item.text)):
+            pending_retry_observed = True
+            continue
         if _EXCEPTION_SUMMARY_RE.search(item.text):
             return item.line
         if _WATCHDOG_EXCEPTION_RE.search(item.text):
@@ -3326,7 +3663,7 @@ def _terminal_exception_line(lines: Sequence[LogLine], start_line: int) -> int |
             return item.line
         if item.line == start_line and _TERMINAL_OPERATION_TIMEOUT_RE.search(item.text):
             return item.line
-    return start_line
+    return None if pending_retry_observed else start_line
 
 
 def _traceback_causal_role_hint(
@@ -3575,7 +3912,7 @@ def _build_context_windows(
     high_signal_lines: Sequence[int] = (),
     failure_episode_lines: Sequence[int] = (),
     cause_confirmation_lines: Sequence[int] = (),
-) -> list[ContextWindow]:
+) -> _ContextWindowSelection:
     occurrence_group_by_line: dict[int, str] = {}
     for group in occurrence_groups:
         for line_no in group.sample_lines:
@@ -3613,11 +3950,10 @@ def _build_context_windows(
             continue
         seen_registry_groups.add(group_key)
         add_seed(match.line, "registry_candidate")
-        if len(seed_lines) >= MAX_CONTEXT_WINDOW_SEEDS:
-            break
 
     windows: list[ContextWindow] = []
-    for index, (seed, selected_by) in enumerate(seed_lines, start=1):
+    selected_seeds = seed_lines[:MAX_CONTEXT_WINDOW_SEEDS]
+    for index, (seed, selected_by) in enumerate(selected_seeds, start=1):
         start = max(1, seed - CONTEXT_WINDOW_BEFORE_LINES)
         end = min(len(lines), seed + CONTEXT_WINDOW_AFTER_LINES)
         window_lines = tuple(lines[start - 1 : end])
@@ -3634,7 +3970,13 @@ def _build_context_windows(
                 truncated=False,
             )
         )
-    return windows
+    return _ContextWindowSelection(
+        windows=tuple(windows),
+        eligible_seed_count=len(seed_lines),
+        selected_seed_count=len(selected_seeds),
+        omitted_seed_count=max(0, len(seed_lines) - len(selected_seeds)),
+        limit=MAX_CONTEXT_WINDOW_SEEDS,
+    )
 
 
 def _build_candidate_anchors(
@@ -4064,7 +4406,7 @@ def _build_run_progress_summary(
         "first_terminal_incident_timestamp": (
             first_terminal_incident.first_detection_timestamp if first_terminal_incident else None
         ),
-        "configured_terminal_timeout_seconds": (
+        "incident_configured_timeout_seconds": (
             first_terminal_incident.configured_timeout_seconds if first_terminal_incident else None
         ),
         "seconds_from_last_progress_to_terminal_incident": (
@@ -4145,7 +4487,7 @@ def _build_operation_artifact_comparisons(
     primary: FailureEvidence | None,
     distributed_incidents: Sequence[DistributedFailureIncident],
 ) -> tuple[OperationArtifactComparisonEvidence, ...]:
-    return (
+    comparisons = (
         *_build_checkpoint_save_comparisons(
             lines,
             progress,
@@ -4155,6 +4497,43 @@ def _build_operation_artifact_comparisons(
         *_build_checkpoint_load_comparisons(lines, primary),
         *_build_dataloader_read_comparisons(lines),
     )
+    return _remove_stale_operation_failure_links(comparisons, progress, primary)
+
+
+def _remove_stale_operation_failure_links(
+    comparisons: Sequence[OperationArtifactComparisonEvidence],
+    progress: ProgressFacts,
+    primary: FailureEvidence | None,
+) -> tuple[OperationArtifactComparisonEvidence, ...]:
+    """Keep completed historical operations from inheriting a later failure."""
+
+    if primary is None or primary.line is None:
+        return tuple(comparisons)
+    continuation_lines = tuple(
+        marker.line for marker in (*progress.progress_markers, *progress.checkpoint_markers)
+    )
+    normalized: list[OperationArtifactComparisonEvidence] = []
+    for comparison in comparisons:
+        completion_line = comparison.current_completion_line
+        stale_failure_link = (
+            comparison.failure_line == primary.line
+            and completion_line is not None
+            and completion_line < primary.line
+            and any(completion_line < line < primary.line for line in continuation_lines)
+        )
+        if not stale_failure_link:
+            normalized.append(comparison)
+            continue
+        normalized.append(
+            replace(
+                comparison,
+                observation_kind=ArtifactObservationKind.CURRENT_LOG_COMPARISON.value,
+                current_outcome="completed",
+                failure_line=None,
+                failed_observer_ranks=(),
+            )
+        )
+    return tuple(normalized)
 
 
 def _build_checkpoint_save_comparisons(

@@ -22,9 +22,20 @@
     }
   },
   "retry_policy": {
-    "confirmation_retry_allowed_retries": 1,
-    "bounded_retry_allowed_retries": 1,
-    "general_retry_allowed_retries": 3
+    "concrete_confirmation_retry_allowed_retries": 1,
+    "workload_confirmation_retry_allowed_retries": 1,
+    "general_retry_allowed_retries": 2,
+    "job_no_progress_allowed_retries": 3,
+    "job_unknown_progress_allowed_retries": 3
+  },
+  "policy_contexts": {
+    "cuda_oom_no_retry": {
+      "enabled": true
+    },
+    "rejected_iteration_retry_then_skip": {
+      "enabled": true,
+      "allowed_retries": 2
+    }
   },
   "model_defaults": {
     "request": {

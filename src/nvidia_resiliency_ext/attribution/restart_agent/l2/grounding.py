@@ -27,7 +27,9 @@ def model_visible_line_numbers(
                 saw_model_payload = True
                 visible.update(_line_references(model_payload))
         elif event_type == "tool_result":
-            visible.update(_line_references(event.get("result")))
+            tool_data = _successful_tool_data(event)
+            if tool_data is not None:
+                visible.update(_line_references(tool_data))
     if not saw_model_payload:
         visible.update(_line_references(model_view.prompt_payload()))
     return visible
@@ -49,10 +51,20 @@ def model_visible_line_texts(
                 saw_model_payload = True
                 _collect_line_texts(model_payload, visible)
         elif event_type == "tool_result":
-            _collect_line_texts(event.get("result"), visible)
+            tool_data = _successful_tool_data(event)
+            if tool_data is not None:
+                _collect_line_texts(tool_data, visible)
     if not saw_model_payload:
         _collect_line_texts(model_view.prompt_payload(), visible)
     return visible
+
+
+def _successful_tool_data(event: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    result = event.get("result")
+    if not isinstance(result, Mapping) or result.get("status") != "ok":
+        return None
+    data = result.get("data")
+    return data if isinstance(data, Mapping) else None
 
 
 def _collect_line_texts(value: Any, result: dict[int, set[str]]) -> None:

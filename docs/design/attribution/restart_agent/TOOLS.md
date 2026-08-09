@@ -22,6 +22,56 @@ Unknown names, malformed arguments, unsupported requests, and calls outside the
 advertised set are rejected and traced. The product does not dynamically create
 executable tools from model requests.
 
+## Executable Contract Registry
+
+One in-code registry is the source of truth for each tool's advertised JSON
+schema, runtime validation, implementation dispatch, result requirements, and
+limits. Route advertisement selects entries from that registry; it does not
+redefine them.
+
+Arguments are validated without coercion. For example, `"false"` is not a
+Boolean and `"20"` is not an integer. Unknown fields are rejected. Every tool
+response uses this envelope:
+
+```json
+{
+  "schema_version": "restart_agent_tool_result.v1",
+  "tool": "grep_log",
+  "status": "ok",
+  "data": {},
+  "error": null,
+  "truncated": false,
+  "limits": {}
+}
+```
+
+For an error, `status` is `error`, `data` is null, and `error` contains
+`code`, optional `field`, and a bounded message. The closed error codes are:
+
+| Code | Meaning |
+| --- | --- |
+| `malformed_arguments_json` | Arguments are not valid JSON. |
+| `invalid_arguments` | The decoded object violates the tool schema. |
+| `invalid_regex` | `grep_log.pattern` is not a valid Python regular expression. |
+| `tool_not_advertised` | The route did not advertise the requested tool. |
+| `tool_not_implemented` | No executable registry entry exists. |
+| `source_unavailable` | The immutable attempt source cannot be read. |
+| `line_out_of_range` | `read_window.center_line` is outside the source snapshot. |
+| `internal_tool_error` | An unexpected read or serialization failure occurred. |
+
+Tool-name rejection uses advertisement-first precedence. A name outside the
+route's advertised set returns `tool_not_advertised`, whether or not an
+implementation exists. `tool_not_implemented` is reserved for the defensive
+case where an advertised name has no executable registry entry; configuration
+validation normally prevents that state.
+
+Failed envelopes are visible in the interaction transcript but are not source
+evidence and do not expand L2 grounding visibility.
+
+Every per-tool block labeled `Example data` shows only the contents of this
+common envelope's `data` member. A payload-specific `schema_version` inside
+`data` does not replace the outer `restart_agent_tool_result.v1` envelope.
+
 ## Advertised Set
 
 The default route configuration advertises:
@@ -51,22 +101,22 @@ advertised and how many model/tool rounds are allowed.
 | `grep_log.max_matches_hard_limit` | 200 |
 | `read_window.before` | 20 |
 | `read_window.after` | 80 |
-| `read_window.max_lines` | 240 |
+| `read_window.max_lines` | 241 |
 | `read_window.max_chars` | 50000 |
 | `get_evidence_objects.max_refs` | 8 |
 | `get_evidence_objects.max_chars` | 50000 |
 
-Every response reports truncation and relevant applied limits. A cap never
+Every successful response reports truncation and relevant applied limits. A cap never
 silently changes source-line numbering.
 
 ## `overview`
 
-Input: none.
+Input: an object with no fields (`{}`).
 
 Purpose: orient the model to file scale, bounded head/tail content, and the
 existing deterministic evidence without recomputing L0.
 
-Example output:
+Example `data`:
 
 ```json
 {
@@ -88,8 +138,9 @@ Example output:
 }
 ```
 
-The output excludes absolute paths, basenames, eval labels, and path-derived
-hints.
+The output excludes the request's source-log path, its location components,
+eval labels, and hints inferred from that source location. Workload artifact
+paths present in returned log evidence are preserved.
 
 ## `grep_log`
 
@@ -103,10 +154,15 @@ Input:
 }
 ```
 
+`pattern` is a non-empty Python regular expression of at most 4096 characters.
+`ignore_case` is a Boolean and defaults to `true`. `max_matches` is an integer
+from 0 through 200. When omitted, `max_matches` defaults to 50; 50 is not an
+additional cap. An explicit value in the supported range is honored exactly.
+
 Purpose: search the immutable source snapshot while preserving original line
 numbers.
 
-Example output:
+Example `data`:
 
 ```json
 {
@@ -117,8 +173,8 @@ Example output:
 }
 ```
 
-The client bounds requested match count by the hard limit and records any
-truncation.
+Requests beyond the hard limit of 200 are rejected rather than clamped. Results
+that exceed the effective requested match count are truncated explicitly.
 
 ## `read_window`
 
@@ -132,9 +188,14 @@ Input:
 }
 ```
 
+`center_line` is an integer from 1 through the immutable snapshot's line count.
+`before` and `after` are integers from 0 through 120 and default to 20 and 80;
+the largest symmetric request contains 241 lines: 120 before, the center line,
+and 120 after.
+
 Purpose: retrieve original raw lines around a selected source location.
 
-Example output:
+Example `data`:
 
 ```json
 {
@@ -145,28 +206,27 @@ Example output:
 }
 ```
 
-The client bounds before/after context, total lines, and serialized characters.
+The client bounds total lines and serialized characters.
 The result should be large enough to show progress before a failure and
 cascade/recovery after it without becoming an unbounded log dump.
 
-If the range is unavailable because of source truncation, overwrite,
-progressive eviction, or a configured cap, the tool returns a deterministic
-non-crashing result:
+An out-of-range center is rejected with the common error envelope:
 
 ```json
 {
-  "start_line": 1154,
-  "end_line": 1254,
-  "lines": [],
-  "truncated": true,
-  "error": "window_unavailable",
-  "unavailable_reason": "progressive_window_evicted",
-  "candidate_summary_refs": ["cand-17"]
+  "schema_version": "restart_agent_tool_result.v1",
+  "tool": "read_window",
+  "status": "error",
+  "data": null,
+  "error": {
+    "code": "line_out_of_range",
+    "field": "center_line",
+    "message": "center_line is outside the immutable source snapshot."
+  },
+  "truncated": false,
+  "limits": {}
 }
 ```
-
-Retained candidate references may orient the model but are never rendered as
-fabricated raw lines.
 
 ## `get_evidence_objects`
 
@@ -180,11 +240,14 @@ Input:
 }
 ```
 
+`refs` contains 1 through 8 unique, non-empty strings, each no longer than 128
+characters.
+
 Purpose: resolve attempt-scoped L0A object identifiers for occurrence groups,
 windows, anchors, episodes, distributed incidents, and progress/setup markers
 without rescanning the source log.
 
-Example output:
+Example `data`:
 
 ```json
 {
@@ -215,8 +278,12 @@ Missing, invalid, omitted, and truncated objects are represented explicitly.
 - Invalid arguments and unadvertised tools produce structured failures rather
   than exceptions escaping the route.
 - Tool errors do not become evidence.
-- Exhausting the route's tool-round limit makes L1 degraded if no valid final
-  evidence was produced; the deterministic recommendation remains available.
+- Exhausting the route's tool-round limit triggers one forced no-tool final
+  evidence response with reason `forced_final_after_tool_exhaustion`. A
+  contract-valid response remains usable-but-degraded. If that final response
+  does not produce contract-valid evidence, L1 is unusable. This is distinct
+  from `contract_repair`; the deterministic recommendation remains available in
+  either case.
 - Tool result truncation is visible to the model and trace.
 
 ## Observability
@@ -224,16 +291,17 @@ Missing, invalid, omitted, and truncated objects are represented explicitly.
 Each accepted or rejected request records:
 
 - tool-call id;
-- route and model-turn ids;
-- phase;
+- model-turn id (the containing route trace supplies route identity);
 - tool name;
-- redacted argument summary and normalized argument hash;
-- start/end time and latency;
-- visible source offset or line range;
-- returned lines/characters and newly visible line ids;
+- bounded argument summary;
+- latency;
+- serialized result characters and returned line count;
 - match count and truncation;
-- effective caps and caps hit;
-- timeout, execution error, or rejection reason.
+- result status and closed error/rejection code.
+
+The transcript preserves the exact structured envelope, including applied
+limits and any returned source-line range. Evaluation derives duplicate calls,
+newly visible lines, and decision-context yield from that transcript.
 
 Aggregates include:
 

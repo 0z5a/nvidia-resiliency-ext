@@ -255,6 +255,45 @@ No Restart Agent configuration file is required for the managed NVRx path.
 
 ## Observability
 
+### Service Log Contract
+
+The `lib` backend emits stable single-line key/value events to the managed
+attrsvc stdout/stderr log. Every Restart Agent event includes `event`,
+`job_id`, `cycle_id`, and `log_path`; route-dependent events also include
+`candidate_kind` and `route_id`. Durations use numeric seconds with an `_s`
+suffix. An unavailable value is logged as `unknown`, not inferred.
+
+INFO records lifecycle and stage-completion milestones:
+
+| Event | Meaning |
+| --- | --- |
+| `restart_agent.request.accepted` | Attrsvc registered an explicit progressive or terminal request. |
+| `restart_agent.progressive.registered` | Pre-end L0A work was scheduled or explicitly disabled. |
+| `restart_agent.terminal.started` | Authoritative terminal drain and analysis began. |
+| `restart_agent.terminal.drain_completed` | The bounded live-log convergence wait ended. |
+| `restart_agent.candidate.ready` | A deterministic or route-enriched recommendation became available. |
+| `restart_agent.analysis.completed` | The attempt reached its compact final service result. |
+
+`L0A.md` through `L4.md` own the stage-specific INFO events and fields.
+`PROGRESSIVE.md` owns progressive refresh and terminal-drain fields. ERROR or
+WARNING records execution failures, provider degradation, precompute errors,
+and max-wait convergence. DEBUG records substage and individual model/tool-call
+timing. INFO and DEBUG must not contain credentials, prompts, raw model
+responses, tool output, raw log excerpts, or complete evidence objects.
+
+Route-stage `candidate_kind` comes from canonical result provenance, not from
+whether L1 merely returned a structurally usable response.
+
+Every operational emission crosses a best-effort isolation boundary. A log
+projection or handler failure may produce a bounded
+`restart_agent.observability.failed` warning, but it cannot prevent worker
+submission, change an attempt state, alter a recommendation, or stall the
+progressive scheduler.
+
+The service log is operational observability, not a replacement for the
+detailed trace. FT-managed execution does not persist detailed trace artifacts
+by default.
+
 Attrsvc health and stats for `lib` report:
 
 - backend name and effective config fingerprint;

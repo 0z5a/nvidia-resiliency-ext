@@ -183,35 +183,6 @@ def extract_failure_iteration(text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def extract_data_position_fingerprint(text: str) -> str | None:
-    identity = extract_data_position_identity(text)
-    if identity is None:
-        return None
-    _kind, _separator, value = identity.partition(":")
-    return fingerprint_for("data_position", [value])
-
-
-def extract_data_position_identity(text: str) -> str | None:
-    """Return an exact typed data position suitable for entity comparison."""
-
-    patterns = (
-        ("token", r"\btoken_id[=:\s]+([a-z0-9_.-]+)"),
-        ("sample", r"\bsample_id[=:\s]+([a-z0-9_.-]+)"),
-        ("window", r"\bwindow_id[=:\s]+([a-z0-9_.-]+)"),
-        ("token", r"\btoken[=:]+([a-z0-9_.-]+)"),
-        ("sample", r"\bsample[=:]+([a-z0-9_.-]+)"),
-        ("window", r"\bwindow[=:]+([a-z0-9_.-]+)"),
-        ("token", r"\btoken\s+(\d+)\b"),
-        ("sample", r"\bsample\s+(\d+)\b"),
-        ("window", r"\bwindow\s+(\d+)\b"),
-    )
-    for kind, pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            return f"{kind}:{match.group(1)}"
-    return None
-
-
 def build_affected_entity(
     kind: AffectedEntityKind,
     identity: str,

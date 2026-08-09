@@ -13,21 +13,21 @@ from typing import Any, Callable, Iterable
 from ..infrastructure.log_source import LogSnapshot
 from ..models import CausalRole, L0Bundle, L0ModelFacingView, LogLine
 from .contracts import EvidenceTools, L1EvidenceContext
-
-OVERVIEW_HEAD_LINES = 40
-OVERVIEW_TAIL_LINES = 80
-OVERVIEW_MAX_CHARS = 12_000
-GREP_MAX_MATCHES = 50
-GREP_MAX_MATCHES_HARD_LIMIT = 200
-READ_WINDOW_MAX_LINES = 240
-READ_WINDOW_MAX_CHARS = 50_000
-TOOL_LINE_MAX_CHARS = 2_000
-EVIDENCE_OBJECTS_SCHEMA_VERSION = "restart_agent_evidence_objects.v1"
-EVIDENCE_OBJECTS_MAX_REFS = 8
-EVIDENCE_OBJECTS_MAX_CHARS = 50_000
-EVIDENCE_OBJECT_REF_MAX_CHARS = 128
-EVIDENCE_OBJECTS_METADATA_RESERVE_CHARS = 2_048
-
+from .tool_contracts import (
+    EVIDENCE_OBJECT_REF_MAX_CHARS,
+    EVIDENCE_OBJECTS_MAX_CHARS,
+    EVIDENCE_OBJECTS_MAX_REFS,
+    EVIDENCE_OBJECTS_METADATA_RESERVE_CHARS,
+    EVIDENCE_OBJECTS_SCHEMA_VERSION,
+    GREP_MAX_MATCHES,
+    GREP_MAX_MATCHES_HARD_LIMIT,
+    OVERVIEW_HEAD_LINES,
+    OVERVIEW_MAX_CHARS,
+    OVERVIEW_TAIL_LINES,
+    READ_WINDOW_MAX_CHARS,
+    READ_WINDOW_MAX_LINES,
+    TOOL_LINE_MAX_CHARS,
+)
 
 EvidenceToolsFactory = Callable[[L0Bundle, LogSnapshot], EvidenceTools]
 
@@ -48,6 +48,10 @@ class LogTools:
     def __init__(self, bundle: L0Bundle, source_log: LogSnapshot):
         self._bundle = bundle
         self._source_log = source_log
+
+    @property
+    def line_count(self) -> int:
+        return self._bundle.line_count
 
     def overview(self) -> dict[str, Any]:
         return _build_overview(self._bundle, self._source_log)
@@ -501,7 +505,7 @@ def _run_progress_summary_payload(summary: Any) -> dict[str, Any]:
         "progress_after_failure_episode": summary.progress_after_failure_episode,
         "first_terminal_incident_line": summary.first_terminal_incident_line,
         "first_terminal_incident_timestamp": summary.first_terminal_incident_timestamp,
-        "configured_terminal_timeout_seconds": summary.configured_terminal_timeout_seconds,
+        "incident_configured_timeout_seconds": summary.incident_configured_timeout_seconds,
         "seconds_from_last_progress_to_terminal_incident": (
             summary.seconds_from_last_progress_to_terminal_incident
         ),

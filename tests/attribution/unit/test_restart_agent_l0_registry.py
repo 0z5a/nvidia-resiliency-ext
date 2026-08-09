@@ -7,9 +7,11 @@ import pytest
 
 from nvidia_resiliency_ext.attribution.restart_agent.l0.registry import (
     MVP_SIGNATURES,
+    failure_signal_classifiers,
     match_registry,
     root_fingerprint,
 )
+from nvidia_resiliency_ext.attribution.restart_agent.models import FailureClassifier
 
 
 @pytest.mark.parametrize(
@@ -98,6 +100,29 @@ def test_nonfinite_routing_preserves_real_numeric_instability(line):
 
 
 @pytest.mark.parametrize(
+    "line",
+    (
+        "RuntimeError: CUDA out of memory",
+        "torch.AcceleratorError: CUDA error: out of memory",
+        "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2 GiB",
+        "RuntimeError: CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate",
+    ),
+)
+def test_cuda_oom_variants_share_typed_registry_identity(line):
+    rows = match_registry(line)
+
+    assert "cuda_oom" in {row.registry_id for row in rows}
+    assert FailureClassifier.CUDA_OOM.value in failure_signal_classifiers(line)
+
+
+def test_cuda_memory_diagnostic_reference_is_not_an_oom_signal():
+    line = "Search for cudaErrorMemoryAllocation in the CUDA Runtime API documentation"
+
+    assert "cuda_oom" not in {row.registry_id for row in match_registry(line)}
+    assert FailureClassifier.CUDA_OOM.value not in failure_signal_classifiers(line)
+
+
+@pytest.mark.parametrize(
     ("line", "expected"),
     (
         ("slurmstepd: error: JOB CANCELLED DUE TO TIME LIMIT", True),
@@ -110,3 +135,26 @@ def test_time_limit_registry_requires_an_observed_termination_event(line, expect
     rows = match_registry(line)
 
     assert ("time_limit" in {row.registry_id for row in rows}) is expected
+
+
+def test_rejected_nonfinite_iteration_has_policy_neutral_classifiers():
+    classifiers = failure_signal_classifiers(
+        "180: [rank180]: RuntimeError: iteration 670314: Unexpected result inf"
+    )
+
+    assert classifiers == (
+        FailureClassifier.NAN_OR_INF.value,
+        FailureClassifier.REJECTED_NONFINITE_ITERATION.value,
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        "INFO number of nan iterations: 0",
+        "gradient = inf",
+        "RuntimeError: unrelated failure",
+    ),
+)
+def test_rejected_nonfinite_classifier_excludes_ordinary_nonfinite_mentions(line):
+    assert failure_signal_classifiers(line) == ()

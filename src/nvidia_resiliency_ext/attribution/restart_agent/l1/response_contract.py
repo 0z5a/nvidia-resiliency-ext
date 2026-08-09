@@ -32,6 +32,8 @@ class L1ResponseContract:
             "schema_version",
             "analysis_status",
             "primary_failure",
+            "observed_failures",
+            "selected_observed_failure_id",
             "root_cause_assessment",
             "model_recovery_assessment",
             "related_failures",
@@ -39,6 +41,9 @@ class L1ResponseContract:
         }
     )
     primary_failure_fields: frozenset[str] = frozenset({"line", "causal_role", "failure_identity"})
+    observed_failure_fields: frozenset[str] = frozenset(
+        {"id", "line", "causal_role", "failure_identity", "rationale", "evidence_ids"}
+    )
     failure_identity_fields: frozenset[str] = frozenset(
         {"operation", "mechanism", "component", "artifact_path"}
     )
@@ -62,6 +67,7 @@ class L1ResponseContract:
     max_plausible_causes: int = 3
     max_missing_evidence: int = 5
     max_related_failures: int = 3
+    max_observed_failures: int = 3
     max_evidence_items: int = 12
     max_evidence_id_chars: int = 64
     min_confidence: int = 1
@@ -78,8 +84,13 @@ class L1ResponseContract:
         return frozenset(item.value for item in L1AnalysisStatus)
 
     @property
-    def causal_roles(self) -> frozenset[str]:
-        return frozenset(item.value for item in CausalRole)
+    def primary_causal_roles(self) -> frozenset[str]:
+        return frozenset(
+            {
+                CausalRole.INITIATING.value,
+                CausalRole.UNKNOWN.value,
+            }
+        )
 
     @property
     def related_causal_roles(self) -> frozenset[str]:
@@ -104,8 +115,10 @@ class L1ResponseContract:
         return frozenset(item.value for item in AssessmentStatus)
 
     @property
-    def required_primary_support_tags(self) -> frozenset[str]:
-        return self.evidence_support_tags
+    def required_primary_evidence_support_tags(self) -> frozenset[str]:
+        """Return the minimum citations required for a usable identified primary."""
+
+        return frozenset({PRIMARY_FAILURE_SUPPORT_TAG, ROOT_CAUSE_SUPPORT_TAG})
 
     def model_schema(self) -> dict[str, Any]:
         """Return the complete contract advertised in the initial model request."""
@@ -124,7 +137,10 @@ class L1ResponseContract:
                         "type": "integer",
                         "minimum": self.min_confidence,
                         "maximum": self.max_confidence,
-                        "description": "Calibration-only confidence in this claim.",
+                        "description": (
+                            "Calibration-only confidence in a substantive claim; "
+                            "unknown and non-primary placeholders are excluded from calibration."
+                        ),
                     },
                 },
                 "semanticConstraint": (
@@ -146,8 +162,29 @@ class L1ResponseContract:
             "required": sorted(self.primary_failure_fields),
             "properties": {
                 "line": {"type": "integer", "minimum": 1},
-                "causal_role": {"type": "string", "enum": sorted(self.causal_roles)},
+                "causal_role": {
+                    "type": "string",
+                    "enum": sorted(self.primary_causal_roles),
+                },
                 "failure_identity": failure_identity,
+            },
+        }
+        observed_failure = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": sorted(self.observed_failure_fields),
+            "properties": {
+                "id": {"type": "string", "minLength": 1, "maxLength": self.max_evidence_id_chars},
+                "line": {"type": "integer", "minimum": 1},
+                "causal_role": {"type": "string", "enum": sorted(self.related_causal_roles)},
+                "failure_identity": failure_identity,
+                "rationale": {"type": "string", "minLength": 1},
+                "evidence_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "items": {"type": "string", "minLength": 1},
+                },
             },
         }
         return {
@@ -161,6 +198,12 @@ class L1ResponseContract:
                     "enum": sorted(self.analysis_statuses),
                 },
                 "primary_failure": {"oneOf": [primary_failure, {"type": "null"}]},
+                "observed_failures": {
+                    "type": "array",
+                    "maxItems": self.max_observed_failures,
+                    "items": observed_failure,
+                },
+                "selected_observed_failure_id": {"type": ["string", "null"]},
                 "root_cause_assessment": {
                     "type": "object",
                     "additionalProperties": False,
@@ -244,10 +287,21 @@ class L1ResponseContract:
                 "evidence_ids": "unique non-empty strings",
                 "primary_identified": {
                     "primary_failure": "required object",
-                    "evidence": ("non-empty and collectively supports every evidence support tag"),
+                    "observed_failures": (
+                        "optional non-primary failure surfaces retained independently"
+                    ),
+                    "selected_observed_failure_id": (
+                        "optional selected non-primary surface; it does not replace primary_failure"
+                    ),
+                    "evidence": (
+                        "non-empty and collectively supports primary_failure and "
+                        "root_cause_assessment; recovery support is audited by L2"
+                    ),
                 },
                 "no_failure_observed": {
                     "primary_failure": None,
+                    "observed_failures": [],
+                    "selected_observed_failure_id": None,
                     "root_cause_summary": self.no_failure_summary,
                     "root_cause_status": "unknown",
                     "plausible_causes": [],
@@ -259,12 +313,17 @@ class L1ResponseContract:
                 },
                 "insufficient_evidence": {
                     "primary_failure": None,
+                    "observed_failures": "zero or more grounded failure surfaces",
+                    "selected_observed_failure_id": (
+                        "one observed-failure id when a unique terminal surface is selected, else null"
+                    ),
                     "root_cause_summary": self.insufficient_summary,
                     "root_cause_status": "unknown",
                     "plausible_causes": [],
                     "missing_evidence": "one or more strings",
-                    "recovery_claims": "unknown value, unknown status, confidence 1",
-                    "recovery_rationale": self.insufficient_rationale,
+                    "recovery_claims": (
+                        "substantive only when selected_observed_failure_id is non-null; otherwise unknown"
+                    ),
                     "related_failures": [],
                     "evidence": [],
                 },

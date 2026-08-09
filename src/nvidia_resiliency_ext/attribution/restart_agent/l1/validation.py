@@ -28,6 +28,12 @@ def model_evidence_contract_errors(payload: Mapping[str, Any]) -> list[str]:
     elif isinstance(primary, Mapping):
         errors.extend(_primary_failure_errors(primary))
 
+    observed_errors, observed_ids = _observed_failure_errors(payload.get("observed_failures"))
+    errors.extend(observed_errors)
+    selected_observation_id = payload.get("selected_observed_failure_id")
+    if selected_observation_id is not None and selected_observation_id not in observed_ids:
+        errors.append("selected_observed_failure_id must reference an observed failure")
+
     if analysis_status == L1AnalysisStatus.PRIMARY_IDENTIFIED.value and not isinstance(
         primary, Mapping
     ):
@@ -49,9 +55,8 @@ def model_evidence_contract_errors(payload: Mapping[str, Any]) -> list[str]:
     errors.extend(_related_failure_errors(payload.get("related_failures")))
     evidence_errors, support_tags = _evidence_errors(payload.get("evidence"))
     errors.extend(evidence_errors)
-
     if analysis_status == L1AnalysisStatus.PRIMARY_IDENTIFIED.value:
-        for required_support in sorted(L1_RESPONSE_CONTRACT.required_primary_support_tags):
+        for required_support in sorted(L1_RESPONSE_CONTRACT.required_primary_evidence_support_tags):
             if required_support not in support_tags:
                 errors.append(f"evidence must support {required_support}")
     elif analysis_status in {
@@ -84,7 +89,7 @@ def _primary_failure_errors(primary: Mapping[str, Any]) -> list[str]:
         "primary_failure",
     )
     errors.extend(_positive_line_errors(primary.get("line"), "primary_failure.line"))
-    if primary.get("causal_role") not in L1_RESPONSE_CONTRACT.causal_roles:
+    if primary.get("causal_role") not in L1_RESPONSE_CONTRACT.primary_causal_roles:
         errors.append("primary_failure.causal_role is invalid")
     identity = primary.get("failure_identity")
     if not isinstance(identity, Mapping):
@@ -210,6 +215,50 @@ def _related_failure_errors(related: Any) -> list[str]:
     return errors
 
 
+def _observed_failure_errors(value: Any) -> tuple[list[str], set[str]]:
+    if not isinstance(value, list):
+        return ["observed_failures must be an array"], set()
+    errors: list[str] = []
+    ids: set[str] = set()
+    if len(value) > L1_RESPONSE_CONTRACT.max_observed_failures:
+        errors.append(
+            f"observed_failures must contain at most {L1_RESPONSE_CONTRACT.max_observed_failures} items"
+        )
+    for index, item in enumerate(value):
+        field = f"observed_failures[{index}]"
+        if not isinstance(item, Mapping):
+            errors.append(f"{field} must be an object")
+            continue
+        errors.extend(
+            _object_shape_errors(item, L1_RESPONSE_CONTRACT.observed_failure_fields, field)
+        )
+        item_id = item.get("id")
+        if not _nonempty_string(item_id) or item_id in ids:
+            errors.append(f"{field}.id must be a unique non-empty string")
+        else:
+            ids.add(item_id)
+        errors.extend(_positive_line_errors(item.get("line"), f"{field}.line"))
+        if item.get("causal_role") not in L1_RESPONSE_CONTRACT.related_causal_roles:
+            errors.append(f"{field}.causal_role is invalid")
+        if not _nonempty_string(item.get("rationale")):
+            errors.append(f"{field}.rationale must be a non-empty string")
+        identity = item.get("failure_identity")
+        if not isinstance(identity, Mapping):
+            errors.append(f"{field}.failure_identity must be an object")
+        else:
+            errors.extend(
+                _object_shape_errors(
+                    identity,
+                    L1_RESPONSE_CONTRACT.failure_identity_fields,
+                    f"{field}.failure_identity",
+                )
+            )
+        refs = item.get("evidence_ids")
+        if not isinstance(refs, list) or not refs or not all(_nonempty_string(ref) for ref in refs):
+            errors.append(f"{field}.evidence_ids must be a non-empty string array")
+    return errors, ids
+
+
 def _evidence_errors(evidence: Any) -> tuple[list[str], set[str]]:
     if not isinstance(evidence, list):
         return ["evidence must be an array"], set()
@@ -266,6 +315,8 @@ def _non_primary_semantic_errors(
     assessment = payload.get("model_recovery_assessment")
     related = payload.get("related_failures")
     evidence = payload.get("evidence")
+    observed = payload.get("observed_failures")
+    selected_observation_id = payload.get("selected_observed_failure_id")
     if analysis_status == L1AnalysisStatus.NO_FAILURE_OBSERVED.value:
         expected_summary = L1_RESPONSE_CONTRACT.no_failure_summary
         expected_rationale = L1_RESPONSE_CONTRACT.no_failure_rationale
@@ -288,7 +339,11 @@ def _non_primary_semantic_errors(
             and not missing
         ):
             errors.append("insufficient_evidence missing_evidence must not be empty")
-    if isinstance(assessment, Mapping):
+    require_placeholder_recovery = not (
+        analysis_status == L1AnalysisStatus.INSUFFICIENT_EVIDENCE.value
+        and isinstance(selected_observation_id, str)
+    )
+    if isinstance(assessment, Mapping) and require_placeholder_recovery:
         if assessment.get("rationale") != expected_rationale:
             errors.append(
                 f"non-primary model_recovery_assessment.rationale must be "
@@ -307,8 +362,13 @@ def _non_primary_semantic_errors(
                 )
     if related != []:
         errors.append("non-primary related_failures must be empty")
-    if evidence != []:
-        errors.append("non-primary evidence must be empty")
+    if analysis_status == L1AnalysisStatus.NO_FAILURE_OBSERVED.value:
+        if observed != [] or selected_observation_id is not None:
+            errors.append("no_failure_observed forbids observed failures")
+        if evidence != []:
+            errors.append("no_failure_observed evidence must be empty")
+    elif not observed and selected_observation_id is not None:
+        errors.append("selected observation requires observed_failures")
     return errors
 
 
